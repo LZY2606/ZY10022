@@ -2,6 +2,7 @@ using NCalc.Factories;
 using NCalc.Handlers;
 using NCalc.Helpers;
 using NCalc.Exceptions;
+using NCalc.Tracing;
 using static NCalc.Helpers.EvaluationHelper;
 
 namespace NCalc.Visitors;
@@ -19,6 +20,8 @@ public class EvaluationVisitor(
     protected CancellationToken CancellationToken { get; } = cancellationToken;
     protected IEvaluationVisitorFactory? EvaluationVisitorFactory { get; } = evaluationVisitorFactory;
 
+    private EvaluationTrace? Trace => context.Tracer;
+
     protected AsyncEvaluationVisitor CreateAsyncEvaluationVisitor()
     {
         return EvaluationVisitorFactory?.CreateAsyncEvaluationVisitor(context, options, cultureInfo, CancellationToken)
@@ -27,6 +30,29 @@ public class EvaluationVisitor(
 
     public virtual object? Visit(TernaryExpression expression)
     {
+        var trace = Trace;
+        if (trace is null)
+            return EvaluateTernary(expression);
+
+        using var scope = trace.EnterNode(TraceNodeKind.Ternary);
+        try
+        {
+            var left = Convert.ToBoolean(expression.LeftExpression.Accept(this), cultureInfo);
+            var result = left
+                ? EvaluateTernaryTaken(expression)
+                : EvaluateTernaryNotTaken(expression);
+            scope.Complete(result);
+            return result;
+        }
+        catch (Exception exception)
+        {
+            scope.Fault(exception);
+            throw;
+        }
+    }
+
+    private object? EvaluateTernary(TernaryExpression expression)
+    {
         var left = Convert.ToBoolean(expression.LeftExpression.Accept(this), cultureInfo);
 
         return left
@@ -34,7 +60,47 @@ public class EvaluationVisitor(
             : expression.RightExpression.Accept(this);
     }
 
+    private object? EvaluateTernaryTaken(TernaryExpression expression)
+    {
+        Trace?.SkipNode(EvaluationTrace.GetNodeKind(expression.RightExpression),
+            TraceSkipReason.TernaryBranch,
+            EvaluationTrace.GetNodeName(expression.RightExpression),
+            "Condition was true");
+
+        return expression.MiddleExpression.Accept(this);
+    }
+
+    private object? EvaluateTernaryNotTaken(TernaryExpression expression)
+    {
+        Trace?.SkipNode(EvaluationTrace.GetNodeKind(expression.MiddleExpression),
+            TraceSkipReason.TernaryBranch,
+            EvaluationTrace.GetNodeName(expression.MiddleExpression),
+            "Condition was false");
+
+        return expression.RightExpression.Accept(this);
+    }
+
     public virtual object? Visit(BinaryExpression expression)
+    {
+        var trace = Trace;
+        if (trace is null)
+            return EvaluateBinary(expression);
+
+        using var scope = trace.EnterNode(TraceNodeKind.Binary, expression.Type.ToString());
+        try
+        {
+            var result = EvaluateBinary(expression);
+            scope.Complete(result);
+            return result;
+        }
+        catch (Exception exception)
+        {
+            scope.Fault(exception);
+            throw;
+        }
+    }
+
+    private object? EvaluateBinary(BinaryExpression expression)
     {
         var binaryEventArgs = new BinaryEventArgs(expression, this, CreateAsyncEvaluationVisitor(), CancellationToken);
         OnEvaluateBinary(binaryEventArgs);
@@ -42,22 +108,53 @@ public class EvaluationVisitor(
         if (binaryEventArgs.HasResult)
             return binaryEventArgs.Result;
 
+        var trace = Trace;
+
         if (expression.Type == BinaryExpressionType.And)
         {
-            return Convert.ToBoolean(binaryEventArgs.LeftValue(), cultureInfo) &&
-                   Convert.ToBoolean(binaryEventArgs.RightValue(), cultureInfo);
+            var leftValue = Convert.ToBoolean(binaryEventArgs.LeftValue(), cultureInfo);
+            if (leftValue)
+                return Convert.ToBoolean(binaryEventArgs.RightValue(), cultureInfo);
+
+            if (!binaryEventArgs.RightResolved)
+                trace?.SkipNode(EvaluationTrace.GetNodeKind(expression.RightExpression),
+                    TraceSkipReason.ShortCircuitAnd,
+                    EvaluationTrace.GetNodeName(expression.RightExpression),
+                    "Left side of 'and' was false");
+
+            return false;
         }
 
         if (expression.Type == BinaryExpressionType.Or)
         {
-            return Convert.ToBoolean(binaryEventArgs.LeftValue(), cultureInfo) ||
-                   Convert.ToBoolean(binaryEventArgs.RightValue(), cultureInfo);
+            var leftValue = Convert.ToBoolean(binaryEventArgs.LeftValue(), cultureInfo);
+            if (!leftValue)
+                return Convert.ToBoolean(binaryEventArgs.RightValue(), cultureInfo);
+
+            if (!binaryEventArgs.RightResolved)
+                trace?.SkipNode(EvaluationTrace.GetNodeKind(expression.RightExpression),
+                    TraceSkipReason.ShortCircuitOr,
+                    EvaluationTrace.GetNodeName(expression.RightExpression),
+                    "Left side of 'or' was true");
+
+            return true;
         }
 
         if (expression.Type == BinaryExpressionType.Coalesce)
         {
             var leftValue = binaryEventArgs.LeftValue();
-            return leftValue ?? binaryEventArgs.RightValue();
+            if (leftValue is not null)
+            {
+                if (!binaryEventArgs.RightResolved)
+                    trace?.SkipNode(EvaluationTrace.GetNodeKind(expression.RightExpression),
+                        TraceSkipReason.Coalesce,
+                        EvaluationTrace.GetNodeName(expression.RightExpression),
+                        "Left side of '??' was not null");
+
+                return leftValue;
+            }
+
+            return binaryEventArgs.RightValue();
         }
 
         var left = binaryEventArgs.LeftValue();
@@ -68,12 +165,48 @@ public class EvaluationVisitor(
 
     public virtual object? Visit(UnaryExpression expression)
     {
-        var result = expression.Expression.Accept(this);
+        var trace = Trace;
+        if (trace is null)
+        {
+            var untracedResult = expression.Expression.Accept(this);
+            return Unary(expression, untracedResult, options, cultureInfo);
+        }
 
-        return Unary(expression, result, options, cultureInfo);
+        using var scope = trace.EnterNode(TraceNodeKind.Unary, expression.Type.ToString());
+        try
+        {
+            var result = Unary(expression, expression.Expression.Accept(this), options, cultureInfo);
+            scope.Complete(result);
+            return result;
+        }
+        catch (Exception exception)
+        {
+            scope.Fault(exception);
+            throw;
+        }
     }
 
     public virtual object? Visit(Function function)
+    {
+        var trace = Trace;
+        if (trace is null)
+            return EvaluateFunction(function);
+
+        using var scope = trace.EnterFunction(function.Identifier.Name, function.Parameters);
+        try
+        {
+            var result = EvaluateFunction(function);
+            scope.Complete(result);
+            return result;
+        }
+        catch (Exception exception)
+        {
+            scope.Fault(exception);
+            throw;
+        }
+    }
+
+    private object? EvaluateFunction(Function function)
     {
         var functionName = function.Identifier.Name;
         var functionData = new FunctionData(
@@ -90,39 +223,109 @@ public class EvaluationVisitor(
         OnEvaluateFunction(functionName, functionArgs);
 
         if (functionArgs.HasResult)
+        {
+            Trace?.ResolvedFunction(functionName, TraceResolutionSource.FunctionHandler, functionArgs.Result);
             return functionArgs.Result;
+        }
 
         if (context.Functions.TryGetValue(functionName, out var expressionFunction))
-            return expressionFunction(functionData);
+        {
+            var functionResult = expressionFunction(functionData);
+            Trace?.ResolvedFunction(functionName, TraceResolutionSource.Function, functionResult);
+            return functionResult;
+        }
 
-        return BuiltInFunctionHelper.Evaluate(functionName, functionData);
+        var builtInResult = BuiltInFunctionHelper.Evaluate(functionName, functionData);
+        Trace?.ResolvedFunction(functionName, TraceResolutionSource.BuiltInFunction, builtInResult,
+            "Built-in function");
+        return builtInResult;
     }
 
     public virtual object? Visit(Identifier identifier)
     {
-        var value = GetIdentifierValue(identifier);
+        var trace = Trace;
+        if (trace is null)
+            return EvaluateIdentifier(identifier);
 
-        return value is Expression expression ? expression.Evaluate(CancellationToken) : value;
+        using var scope = trace.EnterNode(TraceNodeKind.Identifier, identifier.Name);
+        try
+        {
+            var result = EvaluateIdentifier(identifier, trace);
+            scope.Complete(result);
+            return result;
+        }
+        catch (Exception exception)
+        {
+            scope.Fault(exception);
+            throw;
+        }
     }
 
-    public virtual object? Visit(ValueExpression expression) => expression.Value;
+    private object? EvaluateIdentifier(Identifier identifier) => EvaluateIdentifier(identifier, null);
+
+    private object? EvaluateIdentifier(Identifier identifier, EvaluationTrace? trace)
+    {
+        var value = GetIdentifierValue(identifier, trace);
+
+        if (value is Expression expression)
+            return expression.Evaluate(trace, CancellationToken);
+
+        return value;
+    }
+
+    public virtual object? Visit(ValueExpression expression)
+    {
+        var trace = Trace;
+        if (trace is null)
+            return expression.Value;
+
+        using var scope = trace.EnterNode(TraceNodeKind.Value, EvaluationTrace.GetNodeName(expression));
+        try
+        {
+            scope.Complete(expression.Value);
+            return expression.Value;
+        }
+        catch (Exception exception)
+        {
+            scope.Fault(exception);
+            throw;
+        }
+    }
 
     public virtual object? Visit(LogicalExpressionList list)
     {
         if (list.Count == 0)
             return Array.Empty<object?>();
 
-        var expressions = list.AsSpan();
-        var listCount = expressions.Length;
+        var trace = Trace;
+        TraceNodeScope? scope = null;
+        if (trace is not null)
+            scope = trace.EnterNode(TraceNodeKind.List);
 
-        var result = new object?[listCount];
-
-        for (var index = 0; index < listCount; index++)
+        try
         {
-            result[index] = expressions[index].Accept(this);
-        }
+            var expressions = list.AsSpan();
+            var listCount = expressions.Length;
+            var result = new object?[listCount];
 
-        return result;
+            for (var index = 0; index < listCount; index++)
+            {
+                result[index] = expressions[index].Accept(this);
+            }
+
+            scope?.Complete(result);
+            return result;
+        }
+        catch (Exception exception)
+        {
+            if (scope is not null)
+                scope.Fault(exception);
+            throw;
+        }
+        finally
+        {
+            scope?.Dispose();
+        }
     }
 
     protected void OnEvaluateFunction(string name, FunctionEventArgs args)
@@ -135,7 +338,7 @@ public class EvaluationVisitor(
         context.EvaluateBinaryHandler?.Invoke(args);
     }
 
-    private object? GetIdentifierValue(Identifier identifier)
+    private object? GetIdentifierValue(Identifier identifier, EvaluationTrace? trace)
     {
         var identifierName = identifier.Name;
 
@@ -144,25 +347,36 @@ public class EvaluationVisitor(
         context.EvaluateParameterHandler?.Invoke(identifierName, parameterArgs);
 
         if (parameterArgs.HasResult)
+        {
+            trace?.ResolvedParameter(identifierName, TraceResolutionSource.ParameterHandler, parameterArgs.Result);
             return parameterArgs.Result;
+        }
 
         if (context.Parameters.TryGetValue(identifierName, out var parameter))
         {
             if (parameter is Expression expression)
             {
+                trace?.ResolvedParameter(identifierName, TraceResolutionSource.StaticParameter, null,
+                    "Nested expression");
                 ShareParametersWithChildExpression(expression);
                 return expression;
             }
 
+            trace?.ResolvedParameter(identifierName, TraceResolutionSource.StaticParameter, parameter);
             return parameter;
         }
 
         if (context.DynamicParameters.TryGetValue(identifierName, out var dynamicParameter))
-            return dynamicParameter(new ParameterData(identifier.Id, context, CancellationToken));
+        {
+            var dynamicResult = dynamicParameter(new ParameterData(identifier.Id, context, CancellationToken));
+            trace?.ResolvedParameter(identifierName, TraceResolutionSource.DynamicParameter, dynamicResult);
+            return dynamicResult;
+        }
 
         if (identifierName.Equals("null", StringComparison.InvariantCultureIgnoreCase) &&
             options.AllowNullParameter)
         {
+            trace?.ResolvedParameter(identifierName, TraceResolutionSource.NullKeyword, null);
             return null;
         }
 

@@ -1,4 +1,5 @@
 using NCalc.Exceptions;
+using NCalc.Tracing;
 using NCalc.Visitors;
 
 namespace NCalc.Handlers;
@@ -33,11 +34,13 @@ public class FunctionData(
             throw new NCalcEvaluationException(
                 "Asynchronous binary value evaluation is not available in this context.");
 
+        Context.Tracer?.MarkFunctionArgument(Arguments[index]);
         return Arguments[index].Accept(AsyncVisitor);
     }
 
     public object? Evaluate(int index)
     {
+        Context.Tracer?.MarkFunctionArgument(Arguments[index]);
         return Arguments[index].Accept(SyncVisitor);
     }
     public int Count => Arguments.Count;

@@ -1,6 +1,7 @@
 using System.Collections.Frozen;
 using System.Collections.Immutable;
 using NCalc.Handlers;
+using NCalc.Tracing;
 
 namespace NCalc;
 
@@ -24,6 +25,13 @@ public sealed class ExpressionContext
     public IDictionary<string, AsyncExpressionFunction> AsyncFunctions { get; init; }
 
     public EvaluateBinaryHandler? EvaluateBinaryHandler { get; set; }
+
+    /// <summary>
+    /// The trace attached to the current evaluation, if any. Not part of the copied public state:
+    /// every evaluation binds its own trace so traces never leak between evaluations or share
+    /// sequence numbers.
+    /// </summary>
+    internal EvaluationTrace? Tracer { get; set; }
     public EvaluateBinaryAsyncHandler? EvaluateBinaryAsyncHandler { get; set; }
     public EvaluateParameterHandler? EvaluateParameterHandler { get; set; }
     public EvaluateAsyncParameterHandler? EvaluateAsyncParameterHandler { get; set; }

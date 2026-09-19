@@ -64,6 +64,9 @@
     - name: Logging
       icon: bi bi-file-text
       href: runtime/logging.md
+    - name: Evaluation Tracing
+      icon: bi bi-signpost-split
+      href: runtime/tracing.md
 - name: Extensibility
   icon: bi bi-puzzle
   href: extensibility/index.md

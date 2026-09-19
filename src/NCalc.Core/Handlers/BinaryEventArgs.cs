@@ -44,6 +44,16 @@ public class BinaryEventArgs(
     private bool _rightResolved;
 
     /// <summary>
+    /// Whether the left operand has been evaluated yet.
+    /// </summary>
+    internal bool LeftResolved => _leftResolved;
+
+    /// <summary>
+    /// Whether the right operand has been evaluated yet.
+    /// </summary>
+    internal bool RightResolved => _rightResolved;
+
+    /// <summary>
     /// Lazily evaluates and returns the left side expression. Resolved only once.
     /// </summary>
     public object? LeftValue()

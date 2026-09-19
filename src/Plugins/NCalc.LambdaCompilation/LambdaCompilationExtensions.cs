@@ -16,6 +16,8 @@ public static class LambdaCompilationExtensions
         UseSystemLinqCompiler = AppContext.TryGetSwitch("NCalc.UseSystemLinqCompiler", out var enabled) && enabled;
     }
 
+    internal static bool UseSystemLinqCompilerPublic => UseSystemLinqCompiler;
+
 #if !DOCFX
      extension(Expression expression)
     {

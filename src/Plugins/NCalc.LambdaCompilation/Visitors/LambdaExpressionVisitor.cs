@@ -44,6 +44,8 @@ public sealed class LambdaExpressionVisitor : ILogicalExpressionVisitor<LinqExpr
         _context = context;
     }
 
+    internal LinqExpression VisitPlaceholder(PlaceholderExpression placeholder) => placeholder.Expression;
+
     public LinqExpression Visit(TernaryExpression expression)
     {
         var conditional = expression.LeftExpression.Accept(this);

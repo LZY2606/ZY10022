@@ -5,6 +5,7 @@ using NCalc.Extensions;
 using NCalc.Factories;
 using NCalc.Handlers;
 using NCalc.Helpers;
+using NCalc.Tracing;
 using NCalc.Visitors;
 
 namespace NCalc;
@@ -260,22 +261,60 @@ public class Expression
     /// </summary>
     /// <exception cref="NCalcException">Thrown when there is an error in the expression.</exception>
     public object? Evaluate(CancellationToken cancellationToken = default)
+        => Evaluate((EvaluationTrace?)null, cancellationToken);
+
+    /// <summary>
+    /// Evaluates the logical expression while recording an explanation trace.
+    /// </summary>
+    /// <param name="trace">
+    /// A fresh <see cref="EvaluationTrace"/> receiving node enter/exit, skip, resolution, cache and
+    /// fault records. The trace belongs to this single evaluation: pass a new instance for every call.
+    /// </param>
+    /// <param name="cancellationToken">The cancellation token.</param>
+    /// <returns>The evaluation result, identical to an untraced evaluation.</returns>
+    /// <exception cref="NCalcException">Thrown when there is an error in the expression.</exception>
+    /// <remarks>
+    /// Tracing never evaluates a node twice: parameters and functions are still called exactly once,
+    /// and short-circuited branches are only reported as skipped.
+    /// </remarks>
+    public object? Evaluate(EvaluationTrace? trace, CancellationToken cancellationToken = default)
     {
-        LogicalExpression ??= GetLogicalExpression(cancellationToken);
+        LogicalExpression ??= GetLogicalExpression(cancellationToken, trace);
 
         if (Error is not null)
             throw Error;
 
+        var previousTracer = Context.Tracer;
+        TraceNodeScope? rootScope = null;
+        Context.Tracer = trace ?? previousTracer;
+        if (trace is not null)
+            rootScope = trace.EnterRoot();
+
         try
         {
+            object? result;
             if (EvaluationOptions.IterateParameters)
-                return IterateParameters(cancellationToken);
+                result = IterateParameters(cancellationToken);
+            else
+                result = LogicalExpression?.Accept(CreateEvaluationVisitor(Context, cancellationToken));
 
-            return LogicalExpression?.Accept(CreateEvaluationVisitor(Context, cancellationToken));
+            rootScope?.Complete(result);
+            return result;
         }
-        catch (InvalidCastException exception)
+        catch (InvalidCastException invalidCastException)
         {
-            throw new NCalcEvaluationException("Error evaluating expression.", exception);
+            rootScope?.Fault(invalidCastException);
+            throw new NCalcEvaluationException("Error evaluating expression.", invalidCastException);
+        }
+        catch (Exception exception)
+        {
+            rootScope?.Fault(exception);
+            throw;
+        }
+        finally
+        {
+            rootScope?.Dispose();
+            Context.Tracer = previousTracer;
         }
     }
 
@@ -292,31 +331,72 @@ public class Expression
     }
 
     /// <summary>
+    /// Evaluates the logical expression into <typeparamref name="T"/> while recording a trace.
+    /// </summary>
+    public T? Evaluate<T>(EvaluationTrace? trace, CancellationToken cancellationToken = default)
+    {
+        return CastResult<T>(Evaluate(trace, cancellationToken), CultureInfo);
+    }
+
+    /// <summary>
     /// Asynchronously evaluates the logical expression.
     /// </summary>
     /// <returns>The result of the evaluation.</returns>
     /// <exception cref="NCalcException">Thrown when there is an error in the expression.</exception>
-    public async ValueTask<object?> EvaluateAsync(CancellationToken cancellationToken = default)
+    public ValueTask<object?> EvaluateAsync(CancellationToken cancellationToken = default)
+        => EvaluateAsync((EvaluationTrace?)null, cancellationToken);
+
+    /// <summary>
+    /// Asynchronously evaluates the logical expression while recording an explanation trace.
+    /// </summary>
+    /// <param name="trace">A fresh <see cref="EvaluationTrace"/> for this single evaluation.</param>
+    /// <param name="cancellationToken">The cancellation token.</param>
+    /// <returns>The evaluation result, identical to an untraced evaluation.</returns>
+    /// <remarks>
+    /// Logical parent identifiers are the same as in synchronous evaluation even when concurrent
+    /// asynchronous branches complete in a different order.
+    /// </remarks>
+    public async ValueTask<object?> EvaluateAsync(EvaluationTrace? trace, CancellationToken cancellationToken = default)
     {
-        LogicalExpression ??= GetLogicalExpression(cancellationToken);
+        LogicalExpression ??= GetLogicalExpression(cancellationToken, trace);
 
         if (Error is not null)
             throw Error;
 
+        var previousTracer = Context.Tracer;
+        TraceNodeScope? rootScope = null;
+        Context.Tracer = trace ?? previousTracer;
+        if (trace is not null)
+            rootScope = trace.EnterRoot();
+
         try
         {
+            object? result;
             if (EvaluationOptions.IterateParameters)
-                return await IterateParametersAsync(cancellationToken).ConfigureAwait(false);
+                result = await IterateParametersAsync(cancellationToken).ConfigureAwait(false);
+            else if (LogicalExpression is null)
+                result = null;
+            else
+                result = await LogicalExpression.Accept(CreateAsyncEvaluationVisitor(Context, cancellationToken))
+                    .ConfigureAwait(false);
 
-            if (LogicalExpression is null)
-                return null;
-
-            return await LogicalExpression.Accept(CreateAsyncEvaluationVisitor(Context, cancellationToken))
-                .ConfigureAwait(false);
+            rootScope?.Complete(result);
+            return result;
         }
-        catch (InvalidCastException exception)
+        catch (InvalidCastException invalidCastException)
         {
-            throw new NCalcEvaluationException("Error evaluating expression.", exception);
+            rootScope?.Fault(invalidCastException);
+            throw new NCalcEvaluationException("Error evaluating expression.", invalidCastException);
+        }
+        catch (Exception exception)
+        {
+            rootScope?.Fault(exception);
+            throw;
+        }
+        finally
+        {
+            rootScope?.Dispose();
+            Context.Tracer = previousTracer;
         }
     }
 
@@ -327,9 +407,17 @@ public class Expression
     /// <returns>The evaluation result converted to type <typeparamref name="T"/>, or <c>default</c> if the result is <c>null</c>.</returns>
     /// <exception cref="NCalcCastException">Thrown when the result cannot be cast to type <typeparamref name="T"/>.</exception>
     /// <exception cref="NCalcException">Thrown when there is an error in the expression.</exception>
-    public async ValueTask<T?> EvaluateAsync<T>(CancellationToken cancellationToken = default)
+    public ValueTask<T?> EvaluateAsync<T>(CancellationToken cancellationToken = default)
     {
-        return CastResult<T>(await EvaluateAsync(cancellationToken).ConfigureAwait(false), CultureInfo);
+        return EvaluateAsync<T>(null, cancellationToken);
+    }
+
+    /// <summary>
+    /// Asynchronously evaluates the logical expression into <typeparamref name="T"/> while recording a trace.
+    /// </summary>
+    public async ValueTask<T?> EvaluateAsync<T>(EvaluationTrace? trace, CancellationToken cancellationToken = default)
+    {
+        return CastResult<T>(await EvaluateAsync(trace, cancellationToken).ConfigureAwait(false), CultureInfo);
     }
 
     private static T? CastResult<T>(object? result, CultureInfo cultureInfo)
@@ -451,6 +539,9 @@ public class Expression
     /// </summary>
     /// <returns>The parsed logical expression, or <c>null</c> when parsing fails.</returns>
     public LogicalExpression? GetLogicalExpression(CancellationToken cancellationToken = default)
+        => GetLogicalExpression(cancellationToken, null);
+
+    internal LogicalExpression? GetLogicalExpression(CancellationToken cancellationToken, EvaluationTrace? trace)
     {
         if (string.IsNullOrEmpty(ExpressionString))
         {
@@ -461,7 +552,10 @@ public class Expression
         }
 
         if (Configuration.CacheEnabled && LogicalExpressionCache.TryGetValue(ExpressionString!, out var cached))
+        {
+            trace?.RecordCacheHit(ExpressionString!);
             return cached;
+        }
 
         try
         {
