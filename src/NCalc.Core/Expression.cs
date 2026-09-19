@@ -5,6 +5,7 @@ using NCalc.Extensions;
 using NCalc.Factories;
 using NCalc.Handlers;
 using NCalc.Helpers;
+using NCalc.Tracing;
 using NCalc.Visitors;
 
 namespace NCalc;
@@ -250,6 +251,22 @@ public class Expression
                    cancellationToken: cancellationToken);
     }
 
+    private EvaluationVisitor CreateTracedEvaluationVisitor(ExpressionContext context,
+        CancellationToken cancellationToken, EvaluationTrace trace, int parentNodeId)
+    {
+        var visitor = CreateEvaluationVisitor(context, cancellationToken);
+        visitor.AttachTrace(trace, parentNodeId);
+        return visitor;
+    }
+
+    private AsyncEvaluationVisitor CreateTracedAsyncEvaluationVisitor(ExpressionContext context,
+        CancellationToken cancellationToken, EvaluationTrace trace, int parentNodeId)
+    {
+        var visitor = CreateAsyncEvaluationVisitor(context, cancellationToken);
+        visitor.AttachTrace(trace, parentNodeId);
+        return visitor;
+    }
+
     internal void SetEvaluationVisitorFactory(IEvaluationVisitorFactory? evaluationVisitorFactory)
     {
         EvaluationVisitorFactory ??= evaluationVisitorFactory;
@@ -260,8 +277,21 @@ public class Expression
     /// </summary>
     /// <exception cref="NCalcException">Thrown when there is an error in the expression.</exception>
     public object? Evaluate(CancellationToken cancellationToken = default)
+        => Evaluate(null, cancellationToken);
+
+    /// <summary>
+    /// Evaluates the logical expression and records diagnostic events to <paramref name="trace"/>.
+    /// </summary>
+    /// <param name="trace">An optional per-evaluation trace. When <c>null</c>, no tracing is performed.</param>
+    /// <param name="cancellationToken">A token used to cancel the evaluation.</param>
+    /// <returns>The evaluation result.</returns>
+    /// <exception cref="NCalcException">Thrown when there is an error in the expression.</exception>
+    public object? Evaluate(EvaluationTrace? trace, CancellationToken cancellationToken = default)
+        => EvaluateWithTrace(trace!, 0, cancellationToken);
+
+    internal object? EvaluateWithTrace(EvaluationTrace trace, int parentNodeId, CancellationToken cancellationToken)
     {
-        LogicalExpression ??= GetLogicalExpression(cancellationToken);
+        LogicalExpression ??= GetLogicalExpression(cancellationToken, trace);
 
         if (Error is not null)
             throw Error;
@@ -269,9 +299,16 @@ public class Expression
         try
         {
             if (EvaluationOptions.IterateParameters)
-                return IterateParameters(cancellationToken);
+                return IterateParameters(cancellationToken, trace);
 
-            return LogicalExpression?.Accept(CreateEvaluationVisitor(Context, cancellationToken));
+            if (LogicalExpression is null)
+                return null;
+
+            if (trace is null)
+                return LogicalExpression.Accept(CreateEvaluationVisitor(Context, cancellationToken));
+
+            return trace.Run(0, EvaluationTraceNodeKind.Root, ExpressionString ?? string.Empty,
+                parentId => EvaluateLogicalExpression(trace, parentNodeId == 0 ? parentId : parentNodeId, cancellationToken));
         }
         catch (InvalidCastException exception)
         {
@@ -297,8 +334,22 @@ public class Expression
     /// <returns>The result of the evaluation.</returns>
     /// <exception cref="NCalcException">Thrown when there is an error in the expression.</exception>
     public async ValueTask<object?> EvaluateAsync(CancellationToken cancellationToken = default)
+        => await EvaluateAsync(null, cancellationToken).ConfigureAwait(false);
+
+    /// <summary>
+    /// Asynchronously evaluates the logical expression and records diagnostic events to <paramref name="trace"/>.
+    /// </summary>
+    /// <param name="trace">An optional per-evaluation trace. When <c>null</c>, no tracing is performed.</param>
+    /// <param name="cancellationToken">A token used to cancel the evaluation.</param>
+    /// <returns>The evaluation result.</returns>
+    /// <exception cref="NCalcException">Thrown when there is an error in the expression.</exception>
+    public async ValueTask<object?> EvaluateAsync(EvaluationTrace? trace, CancellationToken cancellationToken = default)
+        => await EvaluateWithTraceAsync(trace!, 0, cancellationToken).ConfigureAwait(false);
+
+    internal async ValueTask<object?> EvaluateWithTraceAsync(EvaluationTrace trace, int parentNodeId,
+        CancellationToken cancellationToken)
     {
-        LogicalExpression ??= GetLogicalExpression(cancellationToken);
+        LogicalExpression ??= GetLogicalExpression(cancellationToken, trace);
 
         if (Error is not null)
             throw Error;
@@ -306,12 +357,20 @@ public class Expression
         try
         {
             if (EvaluationOptions.IterateParameters)
-                return await IterateParametersAsync(cancellationToken).ConfigureAwait(false);
+                return await IterateParametersAsync(cancellationToken, trace).ConfigureAwait(false);
 
             if (LogicalExpression is null)
                 return null;
 
-            return await LogicalExpression.Accept(CreateAsyncEvaluationVisitor(Context, cancellationToken))
+            if (trace is null)
+            {
+                return await LogicalExpression.Accept(CreateAsyncEvaluationVisitor(Context, cancellationToken))
+                    .ConfigureAwait(false);
+            }
+
+            return await trace.RunAsync(0, EvaluationTraceNodeKind.Root, ExpressionString ?? string.Empty,
+                parentId => LogicalExpression.Accept(CreateTracedAsyncEvaluationVisitor(Context, cancellationToken, trace!,
+                    parentNodeId == 0 ? parentId : parentNodeId)))
                 .ConfigureAwait(false);
         }
         catch (InvalidCastException exception)
@@ -351,15 +410,15 @@ public class Expression
         }
     }
 
-    private async ValueTask<object?> IterateParametersAsync(CancellationToken cancellationToken)
+    private async ValueTask<object?> IterateParametersAsync(CancellationToken cancellationToken, EvaluationTrace? trace)
     {
         var parameterEnumerators = ParametersHelper.GetEnumerators(Context.Parameters, out var size);
         if (LogicalExpression is null)
             return null;
 
-        var visitor = CreateAsyncEvaluationVisitor(Context, cancellationToken);
+        var visitor = CreateTracedAsyncEvaluationVisitor(Context, cancellationToken, trace!, trace?.CurrentNodeId ?? 0);
         if (size is null)
-            return await LogicalExpression.Accept(visitor).ConfigureAwait(false);
+            return await AcceptRootAsync(LogicalExpression, visitor, trace).ConfigureAwait(false);
 
         var results = new List<object?>(size.Value);
         for (var i = 0; i < size; i++)
@@ -370,21 +429,21 @@ public class Expression
                 Context.Parameters[parameter.Key] = parameter.Value.Current;
             }
 
-            results.Add(await LogicalExpression.Accept(visitor).ConfigureAwait(false));
+            results.Add(await AcceptRootAsync(LogicalExpression, visitor, trace).ConfigureAwait(false));
         }
 
         return results;
     }
 
-    private object? IterateParameters(CancellationToken cancellationToken)
+    private object? IterateParameters(CancellationToken cancellationToken, EvaluationTrace? trace)
     {
         var parameterEnumerators = ParametersHelper.GetEnumerators(Context.Parameters, out var size);
         if (LogicalExpression is null)
             return null;
 
-        var visitor = CreateEvaluationVisitor(Context, cancellationToken);
+        var visitor = CreateTracedEvaluationVisitor(Context, cancellationToken, trace!, trace?.CurrentNodeId ?? 0);
         if (size is null)
-            return LogicalExpression.Accept(visitor);
+            return AcceptRoot(LogicalExpression, visitor, trace);
 
         var results = new List<object?>(size.Value);
         for (var i = 0; i < size; i++)
@@ -395,7 +454,7 @@ public class Expression
                 Context.Parameters[parameter.Key] = parameter.Value.Current;
             }
 
-            results.Add(LogicalExpression.Accept(visitor));
+            results.Add(AcceptRoot(LogicalExpression, visitor, trace));
         }
 
         return results;
@@ -451,6 +510,9 @@ public class Expression
     /// </summary>
     /// <returns>The parsed logical expression, or <c>null</c> when parsing fails.</returns>
     public LogicalExpression? GetLogicalExpression(CancellationToken cancellationToken = default)
+        => GetLogicalExpression(cancellationToken, null);
+
+    private LogicalExpression? GetLogicalExpression(CancellationToken cancellationToken, EvaluationTrace? trace)
     {
         if (string.IsNullOrEmpty(ExpressionString))
         {
@@ -461,7 +523,10 @@ public class Expression
         }
 
         if (Configuration.CacheEnabled && LogicalExpressionCache.TryGetValue(ExpressionString!, out var cached))
+        {
+            trace?.CacheHit(ExpressionString!);
             return cached;
+        }
 
         try
         {
@@ -476,6 +541,30 @@ public class Expression
             Error = exception;
             return null;
         }
+    }
+
+    private static object? AcceptRoot(LogicalExpression expression, EvaluationVisitor visitor, EvaluationTrace? trace)
+    {
+        if (trace is null)
+            return expression.Accept(visitor);
+
+        return trace.Run(trace.CurrentNodeId, EvaluationTraceNodeKind.Root, string.Empty,
+            _ => expression.Accept(visitor));
+    }
+
+    private object? EvaluateLogicalExpression(EvaluationTrace trace, int parentNodeId, CancellationToken cancellationToken)
+    {
+        return LogicalExpression!.Accept(CreateTracedEvaluationVisitor(Context, cancellationToken, trace!, parentNodeId));
+    }
+
+    private static Task<object?> AcceptRootAsync(LogicalExpression expression, AsyncEvaluationVisitor visitor,
+        EvaluationTrace? trace)
+    {
+        if (trace is null)
+            return expression.Accept(visitor);
+
+        return trace.RunAsync(trace.CurrentNodeId, EvaluationTraceNodeKind.Root, string.Empty,
+            _ => expression.Accept(visitor));
     }
 
     /// <summary>

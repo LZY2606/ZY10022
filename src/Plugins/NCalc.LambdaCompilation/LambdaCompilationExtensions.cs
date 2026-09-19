@@ -1,7 +1,7 @@
 ﻿using System.Runtime.CompilerServices;
 using FastExpressionCompiler;
-using NCalc.Exceptions;
 using NCalc.LambdaCompilation.Visitors;
+using NCalc.Tracing;
 using LinqExpression = System.Linq.Expressions.Expression;
 using LinqParameterExpression = System.Linq.Expressions.ParameterExpression;
 
@@ -17,79 +17,129 @@ public static class LambdaCompilationExtensions
     }
 
 #if !DOCFX
-     extension(Expression expression)
+    /// <summary>Compiles an expression to a parameterless delegate.</summary>
+    public static Func<TResult> ToLambda<TResult>(this Expression expression,
+        CancellationToken cancellationToken = default)
     {
-        public Func<TResult> ToLambda<TResult>(CancellationToken cancellationToken = default)
-        {
-            var body = expression.ToLinqExpression<TResult>(cancellationToken);
-            var lambda = LinqExpression.Lambda<Func<TResult>>(body);
+        var linq = Build(expression, typeof(Void), typeof(TResult), null, cancellationToken);
+        var lambda = LinqExpression.Lambda<Func<TResult>>(linq.Expression);
+        return UseSystemLinqCompiler ? lambda.Compile() : lambda.CompileFast();
+    }
 
-            if (UseSystemLinqCompiler)
-                return lambda.Compile();
+    /// <summary>Compiles an expression to a delegate that records each invocation in the supplied trace.</summary>
+    public static Func<EvaluationTrace, TResult> ToTracedLambda<TResult>(this Expression expression,
+        CancellationToken cancellationToken = default)
+    {
+        var traceParameter = LinqExpression.Parameter(typeof(EvaluationTrace), "trace");
+        var linq = Build(expression, typeof(Void), typeof(TResult), traceParameter, cancellationToken);
+        var lambda = LinqExpression.Lambda<Func<EvaluationTrace, TResult>>(linq.Expression, traceParameter);
+        return UseSystemLinqCompiler ? lambda.Compile() : lambda.CompileFast();
+    }
 
-            return lambda.CompileFast();
-        }
+    /// <summary>Compiles an expression to a delegate that receives a strongly typed context object.</summary>
+    public static Func<TContext, TResult> ToLambda<TContext, TResult>(this Expression expression,
+        CancellationToken cancellationToken = default)
+    {
+        var linq = Build(expression, typeof(TContext), typeof(TResult), null, cancellationToken);
+        var lambda = LinqExpression.Lambda<Func<TContext, TResult>>(linq.Expression, linq.Parameter!);
+        return UseSystemLinqCompiler ? lambda.Compile() : lambda.CompileFast();
+    }
 
-        public Func<TContext, TResult> ToLambda<TContext, TResult>(CancellationToken cancellationToken = default)
-        {
-            var linqExp = expression.ToLinqExpression<TContext, TResult>(cancellationToken);
-            if (linqExp.Parameter != null)
-            {
-                var lambda = LinqExpression.Lambda<Func<TContext, TResult>>(linqExp.Expression, linqExp.Parameter);
+    /// <summary>Compiles a context-aware expression and records each invocation in the supplied trace.</summary>
+    public static Func<EvaluationTrace, TContext, TResult> ToTracedLambda<TContext, TResult>(
+        this Expression expression, CancellationToken cancellationToken = default)
+    {
+        var traceParameter = LinqExpression.Parameter(typeof(EvaluationTrace), "trace");
+        var linq = Build(expression, typeof(TContext), typeof(TResult), traceParameter, cancellationToken);
+        var lambda = LinqExpression.Lambda<Func<EvaluationTrace, TContext, TResult>>(
+            linq.Expression, traceParameter, linq.Parameter!);
+        return UseSystemLinqCompiler ? lambda.Compile() : lambda.CompileFast();
+    }
 
-                if (UseSystemLinqCompiler)
-                    return lambda.Compile();
+    /// <summary>Builds a LINQ expression for a parameterless invocation.</summary>
+    public static LinqExpression ToLinqExpression<TResult>(this Expression expression,
+        CancellationToken cancellationToken = default)
+    {
+        return Build(expression, typeof(Void), typeof(TResult), null, cancellationToken).Expression;
+    }
 
-                return lambda.CompileFast();
-            }
+    /// <summary>Builds a LINQ expression that records invocation events in the supplied trace.</summary>
+    public static LinqExpression ToTracedLinqExpression<TResult>(this Expression expression,
+        EvaluationTrace trace, CancellationToken cancellationToken = default)
+    {
+        return Build(expression, typeof(Void), typeof(TResult), LinqExpression.Constant(trace), cancellationToken)
+            .Expression;
+    }
 
-            throw new NCalcException("Linq expression parameter cannot be null");
-        }
+    /// <summary>Builds a LINQ expression and its context parameter.</summary>
+    public static LinqExpressionWithParameter ToLinqExpression<TContext, TResult>(this Expression expression,
+        CancellationToken cancellationToken = default)
+    {
+        return Build(expression, typeof(TContext), typeof(TResult), null, cancellationToken);
+    }
 
-        public LinqExpression ToLinqExpression<TResult>(CancellationToken cancellationToken = default)
-        {
-            return expression.ToLinqExpressionInternal<Void, TResult>(cancellationToken).Expression;
-        }
-
-        public LinqExpressionWithParameter ToLinqExpression<TContext, TResult>(CancellationToken cancellationToken = default)
-        {
-            return expression.ToLinqExpressionInternal<TContext, TResult>(cancellationToken);
-        }
-
-        private LinqExpressionWithParameter ToLinqExpressionInternal<TContext, TResult>(CancellationToken cancellationToken)
-        {
-            expression.LogicalExpression ??= expression.GetLogicalExpression(cancellationToken);
-
-            if (expression.LogicalExpression is null)
-                throw expression.Error!;
-
-            LambdaExpressionVisitor visitor;
-            LinqParameterExpression? parameter = null;
-            if (IsVoidType<TContext>())
-            {
-                visitor = new(expression.Parameters, expression.EvaluationOptions);
-            }
-            else
-            {
-                parameter = LinqExpression.Parameter(typeof(TContext), "ctx");
-                visitor = new(parameter, expression.EvaluationOptions);
-            }
-
-            cancellationToken.ThrowIfCancellationRequested();
-            var body = expression.LogicalExpression.Accept(visitor);
-            if (!IsSameType(body, typeof(TResult)))
-            {
-                body = LinqExpression.Convert(body, typeof(TResult));
-            }
-
-            return new() { Expression = body, Parameter = parameter };
-        }
+    /// <summary>Builds a traced LINQ expression and its context parameter.</summary>
+    public static LinqExpressionWithParameter ToTracedLinqExpression<TContext, TResult>(this Expression expression,
+        EvaluationTrace trace, CancellationToken cancellationToken = default)
+    {
+        return Build(expression, typeof(TContext), typeof(TResult), LinqExpression.Constant(trace), cancellationToken);
     }
 #endif
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static bool IsVoidType<TContext>() => typeof(TContext) == typeof(Void);
+    private static LinqExpressionWithParameter Build(Expression expression, Type contextType, Type resultType,
+        LinqExpression? trace, CancellationToken cancellationToken)
+    {
+        expression.LogicalExpression ??= expression.GetLogicalExpression(cancellationToken);
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static bool IsSameType(LinqExpression expression, Type targetType) => expression.Type == targetType;
+        if (expression.LogicalExpression is null)
+            throw expression.Error!;
+
+        LambdaExpressionVisitor visitor;
+        LinqParameterExpression? parameter = null;
+        LinqParameterExpression? rootId = null;
+        LinqExpression rootParentId = LinqExpression.Constant(0);
+        if (trace is not null)
+        {
+            rootId = LinqExpression.Parameter(typeof(int), "rootId");
+            rootParentId = rootId;
+        }
+
+        if (contextType == typeof(Void))
+        {
+            visitor = trace is null
+                ? new LambdaExpressionVisitor(expression.Parameters, expression.EvaluationOptions)
+                : new LambdaExpressionVisitor(expression.Parameters, expression.EvaluationOptions, trace,
+                    rootParentId);
+        }
+        else
+        {
+            parameter = LinqExpression.Parameter(contextType, "ctx");
+            visitor = trace is null
+                ? new LambdaExpressionVisitor(parameter, expression.EvaluationOptions)
+                : new LambdaExpressionVisitor(parameter, expression.EvaluationOptions, trace,
+                    rootParentId);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        var body = expression.LogicalExpression.Accept(visitor);
+
+        if (trace is not null)
+        {
+            var runMethod = typeof(EvaluationTrace).GetMethods()
+                .First(method => method.Name == nameof(EvaluationTrace.Run) &&
+                                method.IsGenericMethodDefinition &&
+                                method.GetParameters().Length == 4)!
+                .MakeGenericMethod(body.Type);
+            body = LinqExpression.Call(trace, runMethod,
+                LinqExpression.Constant(0),
+                LinqExpression.Constant(EvaluationTraceNodeKind.Root),
+                LinqExpression.Constant(expression.ExpressionString ?? string.Empty),
+                LinqExpression.Lambda(body, rootId!));
+        }
+
+        if (body.Type != resultType)
+            body = LinqExpression.Convert(body, resultType);
+
+        return new LinqExpressionWithParameter { Expression = body, Parameter = parameter };
+    }
 }

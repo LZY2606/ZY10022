@@ -1,4 +1,5 @@
 using NCalc.Exceptions;
+using NCalc.Tracing;
 using NCalc.Visitors;
 
 namespace NCalc.Handlers;
@@ -10,11 +11,15 @@ public class BinaryEventArgs(
     BinaryExpression expression,
     ILogicalExpressionVisitor<object?> syncVisitor,
     ILogicalExpressionVisitor<Task<object?>> asyncVisitor,
-    CancellationToken cancellationToken)
+    CancellationToken cancellationToken,
+    EvaluationTrace? trace = null,
+    int parentNodeId = 0)
     : EventArgs
 {
     private readonly ILogicalExpressionVisitor<object?>? _syncVisitor = syncVisitor;
     private readonly ILogicalExpressionVisitor<Task<object?>>? _asyncVisitor = asyncVisitor;
+    private readonly EvaluationTrace? _trace = trace;
+    private readonly int _parentNodeId = parentNodeId;
 
     /// <summary>
     /// Gets or sets the evaluation result of the binary expression.
@@ -51,7 +56,7 @@ public class BinaryEventArgs(
         if (_leftResolved)
             return _leftResolvedValue;
 
-        _leftResolvedValue = BinaryExpression.LeftExpression.Accept(_syncVisitor!);
+        _leftResolvedValue = Evaluate(BinaryExpression.LeftExpression);
         _leftResolved = true;
         return _leftResolvedValue;
     }
@@ -66,7 +71,7 @@ public class BinaryEventArgs(
 
         if (!_leftResolved)
         {
-            _leftResolvedValue = await BinaryExpression.LeftExpression.Accept(_asyncVisitor);
+            _leftResolvedValue = await EvaluateAsync(BinaryExpression.LeftExpression);
             _leftResolved = true;
         }
 
@@ -80,7 +85,7 @@ public class BinaryEventArgs(
         if (_rightResolved)
             return _rightResolvedValue;
 
-        _rightResolvedValue = BinaryExpression.RightExpression.Accept(_syncVisitor!);
+        _rightResolvedValue = Evaluate(BinaryExpression.RightExpression);
         _rightResolved = true;
         return _rightResolvedValue;
     }
@@ -91,10 +96,27 @@ public class BinaryEventArgs(
 
         if (!_rightResolved)
         {
-            _rightResolvedValue = await BinaryExpression.RightExpression.Accept(_asyncVisitor);
+            _rightResolvedValue = await EvaluateAsync(BinaryExpression.RightExpression);
             _rightResolved = true;
         }
 
         return _rightResolvedValue;
+    }
+
+    private object? Evaluate(LogicalExpression expression)
+    {
+        return _trace is null
+            ? expression.Accept(_syncVisitor!)
+            : ((EvaluationVisitor)_syncVisitor!).EvaluateBinaryChild(expression, _parentNodeId);
+    }
+
+    private Task<object?> EvaluateAsync(LogicalExpression expression)
+    {
+        if (_asyncVisitor is null)
+            throw new NCalcEvaluationException("Asynchronous binary value evaluation is not available in this context.");
+
+        return _trace is null
+            ? expression.Accept(_asyncVisitor)
+            : ((AsyncEvaluationVisitor)_asyncVisitor).EvaluateBinaryChildAsync(expression, _parentNodeId);
     }
 }

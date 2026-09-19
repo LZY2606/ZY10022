@@ -2,6 +2,7 @@ using NCalc.Factories;
 using NCalc.Handlers;
 using NCalc.Helpers;
 using NCalc.Exceptions;
+using NCalc.Tracing;
 using static NCalc.Helpers.EvaluationHelper;
 
 namespace NCalc.Visitors;
@@ -18,29 +19,129 @@ public class AsyncEvaluationVisitor(
 {
     protected CancellationToken CancellationToken { get; } = cancellationToken;
     protected IEvaluationVisitorFactory? EvaluationVisitorFactory { get; } = evaluationVisitorFactory;
+    protected EvaluationTrace? Trace { get; private set; }
+    protected int ParentNodeId { get; private set; }
 
-    protected EvaluationVisitor CreateEvaluationVisitor()
+    internal void AttachTrace(EvaluationTrace? trace, int parentNodeId)
     {
-        return EvaluationVisitorFactory?.CreateEvaluationVisitor(context, options, cultureInfo, CancellationToken)
-               ?? new EvaluationVisitor(context, options, cultureInfo, cancellationToken: CancellationToken);
+        Trace = trace;
+        ParentNodeId = parentNodeId;
     }
 
-    public virtual async Task<object?> Visit(TernaryExpression expression)
+    protected EvaluationVisitor CreateEvaluationVisitor(EvaluationTrace? trace = null, int parentNodeId = 0)
     {
-        // Evaluates the left expression and saves the value
+        var visitor = EvaluationVisitorFactory?.CreateEvaluationVisitor(context, options, cultureInfo, CancellationToken)
+                      ?? new EvaluationVisitor(context, options, cultureInfo, cancellationToken: CancellationToken);
+        visitor.AttachTrace(trace ?? Trace, trace is null ? ParentNodeId : parentNodeId);
+        return visitor;
+    }
+
+    private AsyncEvaluationVisitor CreateSelfForBinary()
+    {
+        var visitor = new AsyncEvaluationVisitor(context, options, cultureInfo, null, CancellationToken);
+        visitor.AttachTrace(Trace, ParentNodeId);
+        return visitor;
+    }
+
+    internal Task<object?> EvaluateTracedChildAsync(LogicalExpression expression, int parentNodeId)
+    {
+        if (Trace is null)
+            return expression.Accept(this);
+
+        var previousParent = ParentNodeId;
+        ParentNodeId = parentNodeId;
+        try
+        {
+            return Trace.RunAsync(parentNodeId, EvaluationVisitor.GetNodeKind(expression),
+                EvaluationVisitor.GetNodeName(expression), _ => expression.Accept(this));
+        }
+        finally
+        {
+            ParentNodeId = parentNodeId;
+        }
+    }
+
+    internal Task<object?> EvaluateBinaryChildAsync(LogicalExpression expression, int parentNodeId)
+    {
+        var previousParent = ParentNodeId;
+        ParentNodeId = parentNodeId;
+        try
+        {
+            return expression.Accept(this);
+        }
+        finally
+        {
+            ParentNodeId = parentNodeId;
+        }
+    }
+
+    protected void SkipChild(LogicalExpression expression, int parentNodeId, string reason = "Short-circuit")
+    {
+        Trace?.Skip(parentNodeId, EvaluationVisitor.GetNodeKind(expression),
+            EvaluationVisitor.GetNodeName(expression), reason);
+    }
+
+    public virtual Task<object?> Visit(TernaryExpression expression)
+    {
+        if (Trace is null)
+            return VisitTernaryWithoutTrace(expression);
+
+        return Trace.RunAsync(ParentNodeId, EvaluationTraceNodeKind.Ternary, "?:",
+            nodeId => VisitTernary(expression, nodeId));
+    }
+
+    private async Task<object?> VisitTernaryWithoutTrace(TernaryExpression expression)
+    {
         var left = Convert.ToBoolean(await expression.LeftExpression.Accept(this), cultureInfo);
 
         if (left)
-        {
             return await expression.MiddleExpression.Accept(this);
-        }
 
         return await expression.RightExpression.Accept(this);
     }
 
-    public virtual async Task<object?> Visit(BinaryExpression expression)
+    private async Task<object?> VisitTernary(TernaryExpression expression, int nodeId)
     {
-        var binaryEventArgs = new BinaryEventArgs(expression, CreateEvaluationVisitor(), this, CancellationToken);
+        var left = Convert.ToBoolean(await EvaluateTracedChildAsync(expression.LeftExpression, nodeId), cultureInfo);
+
+        if (left)
+        {
+            var result = await EvaluateTracedChildAsync(expression.MiddleExpression, nodeId);
+            SkipChild(expression.RightExpression, nodeId);
+            return result;
+        }
+
+        var falseResult = await EvaluateTracedChildAsync(expression.RightExpression, nodeId);
+        SkipChild(expression.MiddleExpression, nodeId);
+        return falseResult;
+    }
+
+    public virtual Task<object?> Visit(BinaryExpression expression)
+    {
+        if (Trace is null)
+            return VisitBinaryWithoutTrace(expression);
+
+        return Trace.RunAsync(ParentNodeId, EvaluationTraceNodeKind.Binary, expression.Type.ToString(),
+            nodeId => VisitBinary(expression, nodeId));
+    }
+
+    private Task<object?> VisitBinaryWithoutTrace(BinaryExpression expression)
+    {
+        var binaryEventArgs = new BinaryEventArgs(expression, CreateEvaluationVisitor(), CreateSelfForBinary(),
+            CancellationToken);
+        return VisitBinary(expression, binaryEventArgs, null, 0);
+    }
+
+    private Task<object?> VisitBinary(BinaryExpression expression, int nodeId)
+    {
+        var binaryEventArgs = new BinaryEventArgs(expression, CreateEvaluationVisitor(Trace, nodeId), CreateSelfForBinary(),
+            CancellationToken, Trace, nodeId);
+        return VisitBinary(expression, binaryEventArgs, Trace, nodeId);
+    }
+
+    private async Task<object?> VisitBinary(BinaryExpression expression, BinaryEventArgs binaryEventArgs,
+        EvaluationTrace? trace, int nodeId)
+    {
         await OnEvaluateBinaryAsync(binaryEventArgs);
 
         if (binaryEventArgs.HasResult)
@@ -48,19 +149,41 @@ public class AsyncEvaluationVisitor(
 
         if (expression.Type == BinaryExpressionType.And)
         {
-            return Convert.ToBoolean(await binaryEventArgs.LeftValueAsync(), cultureInfo) &&
-                   Convert.ToBoolean(await binaryEventArgs.RightValueAsync(), cultureInfo);
+            var left = Convert.ToBoolean(await binaryEventArgs.LeftValueAsync(), cultureInfo);
+            if (!left)
+            {
+                trace?.Skip(nodeId, EvaluationTraceNodeKind.Binary,
+                    EvaluationVisitor.GetNodeName(expression.RightExpression), "Short-circuit");
+                return false;
+            }
+
+            return Convert.ToBoolean(await binaryEventArgs.RightValueAsync(), cultureInfo);
         }
 
         if (expression.Type == BinaryExpressionType.Or)
         {
-            return Convert.ToBoolean(await binaryEventArgs.LeftValueAsync(), cultureInfo) || Convert.ToBoolean(await binaryEventArgs.RightValueAsync(), cultureInfo);
+            var left = Convert.ToBoolean(await binaryEventArgs.LeftValueAsync(), cultureInfo);
+            if (left)
+            {
+                trace?.Skip(nodeId, EvaluationTraceNodeKind.Binary,
+                    EvaluationVisitor.GetNodeName(expression.RightExpression), "Short-circuit");
+                return true;
+            }
+
+            return Convert.ToBoolean(await binaryEventArgs.RightValueAsync(), cultureInfo);
         }
 
         if (expression.Type == BinaryExpressionType.Coalesce)
         {
             var leftValue = await binaryEventArgs.LeftValueAsync();
-            return leftValue ?? await binaryEventArgs.RightValueAsync();
+            if (leftValue is not null)
+            {
+                trace?.Skip(nodeId, EvaluationTraceNodeKind.Binary,
+                    EvaluationVisitor.GetNodeName(expression.RightExpression), "Short-circuit");
+                return leftValue;
+            }
+
+            return await binaryEventArgs.RightValueAsync();
         }
 
         if (options.ConcurrentAsyncEvaluation)
@@ -77,25 +200,44 @@ public class AsyncEvaluationVisitor(
                 cultureInfo);
         }
 
-        var left = await binaryEventArgs.LeftValueAsync();
+        var left2 = await binaryEventArgs.LeftValueAsync();
         var right = await binaryEventArgs.RightValueAsync();
 
-        return EvaluationVisitorHelper.EvaluateBinary(expression.Type, left, right, options, cultureInfo);
+        return EvaluationVisitorHelper.EvaluateBinary(expression.Type, left2, right, options, cultureInfo);
     }
 
-    public virtual async Task<object?> Visit(UnaryExpression expression)
+    public virtual Task<object?> Visit(UnaryExpression expression)
     {
-        // Recursively evaluates the underlying expression
-        var result = await expression.Expression.Accept(this);
+        if (Trace is null)
+            return VisitUnaryWithoutTrace(expression);
 
+        return Trace.RunAsync(ParentNodeId, EvaluationTraceNodeKind.Unary, expression.Type.ToString(),
+            nodeId => VisitUnary(expression, nodeId));
+    }
+
+    private async Task<object?> VisitUnaryWithoutTrace(UnaryExpression expression)
+    {
+        var result = await expression.Expression.Accept(this);
         return Unary(expression, result, options, cultureInfo);
     }
 
-    public virtual async Task<object?> Visit(Function function)
+    private async Task<object?> VisitUnary(UnaryExpression expression, int nodeId)
     {
-        // Don't call parameters right now, instead let the function do it as needed.
-        // Some parameters shouldn't be called, for instance, in a if(), the "not" value might be a division by zero
-        // Evaluating every value could produce unexpected behaviour
+        var result = await EvaluateTracedChildAsync(expression.Expression, nodeId);
+        return Unary(expression, result, options, cultureInfo);
+    }
+
+    public virtual Task<object?> Visit(Function function)
+    {
+        if (Trace is null)
+            return VisitFunctionWithoutTrace(function);
+
+        return Trace.RunAsync(ParentNodeId, EvaluationTraceNodeKind.Function, function.Identifier.Name,
+            nodeId => VisitFunction(function, nodeId));
+    }
+
+    private Task<object?> VisitFunctionWithoutTrace(Function function)
+    {
         var functionName = function.Identifier.Name;
         var syncEvaluationVisitor = CreateEvaluationVisitor();
         var functionData = new FunctionData(
@@ -107,47 +249,135 @@ public class AsyncEvaluationVisitor(
             syncEvaluationVisitor,
             this,
             CancellationToken);
-        var functionArgs = new FunctionEventArgs(functionData);
+        return InvokeFunctionAsync(functionName, functionData, null, 0);
+    }
 
+    private Task<object?> VisitFunction(Function function, int nodeId)
+    {
+        var functionName = function.Identifier.Name;
+        var syncEvaluationVisitor = CreateEvaluationVisitor(Trace, nodeId);
+        var functionData = new FunctionData(
+            function.Identifier.Id,
+            function.Parameters,
+            context,
+            options,
+            cultureInfo,
+            syncEvaluationVisitor,
+            this,
+            CancellationToken,
+            Trace,
+            nodeId);
+        return InvokeFunctionAsync(functionName, functionData, Trace, nodeId);
+    }
+
+    private async Task<object?> InvokeFunctionAsync(string functionName, FunctionData functionData,
+        EvaluationTrace? trace, int nodeId)
+    {
+        var functionArgs = new FunctionEventArgs(functionData);
         await OnEvaluateFunctionAsync(functionName, functionArgs);
 
         if (functionArgs.HasResult)
+        {
+            trace?.ResolveFunction(nodeId, nodeId, functionName, EvaluationTraceResolutionSource.FunctionHandler, functionArgs.Result);
+            functionData.ReportSkippedArguments();
             return functionArgs.Result;
+        }
 
         if (context.Functions.TryGetValue(functionName, out var expressionFunction))
-            return expressionFunction(functionData);
+        {
+            var syncResult = expressionFunction(functionData);
+            trace?.ResolveFunction(nodeId, nodeId, functionName, EvaluationTraceResolutionSource.Function, syncResult);
+            functionData.ReportSkippedArguments();
+            return syncResult;
+        }
 
         if (context.AsyncFunctions.TryGetValue(functionName, out var asyncExpressionFunction))
-            return await asyncExpressionFunction(functionData);
+        {
+            var asyncResult = await asyncExpressionFunction(functionData);
+            trace?.ResolveFunction(nodeId, nodeId, functionName, EvaluationTraceResolutionSource.AsyncFunction, asyncResult);
+            functionData.ReportSkippedArguments();
+            return asyncResult;
+        }
 
-        return await BuiltInFunctionHelper.EvaluateAsync(functionName, functionData);
+        var result = await BuiltInFunctionHelper.EvaluateAsync(functionName, functionData);
+        trace?.ResolveFunction(nodeId, nodeId, functionName, EvaluationTraceResolutionSource.BuiltInFunction, result);
+        functionData.ReportSkippedArguments();
+        return result;
     }
 
-    public virtual async Task<object?> Visit(Identifier identifier)
+    public virtual Task<object?> Visit(Identifier identifier)
     {
-        var value = await GetIdentifierValueAsync(identifier);
+        if (Trace is null)
+            return VisitIdentifierWithoutTrace(identifier);
 
+        return Trace.RunAsync(ParentNodeId, EvaluationTraceNodeKind.Identifier, identifier.Name,
+            nodeId => VisitIdentifier(identifier, nodeId));
+    }
+
+    private async Task<object?> VisitIdentifierWithoutTrace(Identifier identifier)
+    {
+        var value = await GetIdentifierValueAsync(identifier, 0, null);
         return value is Expression expression
-            ? await expression.EvaluateAsync(CancellationToken)
+            ? await EvaluateNestedExpressionAsync(expression, null)
             : value;
     }
 
-    public virtual Task<object?> Visit(ValueExpression expression) => Task.FromResult(expression.Value);
-
-    public virtual async Task<object?> Visit(LogicalExpressionList list)
+    private async Task<object?> VisitIdentifier(Identifier identifier, int nodeId)
     {
-        if (list.Count == 0) return Array.Empty<object?>();
+        var value = await GetIdentifierValueAsync(identifier, nodeId, Trace);
+
+        return value is Expression expression
+            ? await EvaluateNestedExpressionAsync(expression, Trace)
+            : value;
+    }
+
+    public virtual Task<object?> Visit(ValueExpression expression)
+    {
+        if (Trace is null)
+            return Task.FromResult(expression.Value);
+
+        return Trace.RunAsync(ParentNodeId, EvaluationTraceNodeKind.Value, expression.Value?.ToString() ?? "null",
+            _ => Task.FromResult(expression.Value));
+    }
+
+    public virtual Task<object?> Visit(LogicalExpressionList list)
+    {
+        if (Trace is null)
+            return VisitListWithoutTrace(list);
+
+        return Trace.RunAsync(ParentNodeId, EvaluationTraceNodeKind.List, "()",
+            nodeId => VisitList(list, nodeId));
+    }
+
+    private async Task<object?> VisitListWithoutTrace(LogicalExpressionList list)
+    {
+        if (list.Count == 0)
+            return Array.Empty<object?>();
 
         if (options.ConcurrentAsyncEvaluation)
-            return await Task.WhenAll(list.Select(EvaluateAsync));
+            return await Task.WhenAll(list.Select(EvaluateAsyncWithoutTrace));
 
         var listCount = list.Count;
         var result = new object?[listCount];
 
         for (var index = 0; index < listCount; index++)
-        {
-            result[index] = await EvaluateAsync(list[index]);
-        }
+            result[index] = await EvaluateAsyncWithoutTrace(list[index]);
+
+        return result;
+    }
+
+    private async Task<object?> VisitList(LogicalExpressionList list, int nodeId)
+    {
+        if (list.Count == 0)
+            return Array.Empty<object?>();
+
+        if (options.ConcurrentAsyncEvaluation)
+            return await Task.WhenAll(list.Select(expression => EvaluateTracedChildAsync(expression, nodeId)));
+
+        var result = new object?[list.Count];
+
+        for (var index = 0; index < list.Count; index++)
+            result[index] = await EvaluateTracedChildAsync(list[index], nodeId);
 
         return result;
     }
@@ -160,6 +390,7 @@ public class AsyncEvaluationVisitor(
 
         return context.EvaluateAsyncFunctionHandler?.Invoke(name, args) ?? Task.CompletedTask;
     }
+
     protected Task OnEvaluateBinaryAsync(BinaryEventArgs args)
     {
         context.EvaluateBinaryHandler?.Invoke(args);
@@ -169,45 +400,73 @@ public class AsyncEvaluationVisitor(
         return context.EvaluateBinaryAsyncHandler?.Invoke(args) ?? Task.CompletedTask;
     }
 
-    protected Task<object?> EvaluateAsync(LogicalExpression expression)
+    protected Task<object?> EvaluateAsyncWithoutTrace(LogicalExpression expression)
     {
         return expression.Accept(this);
     }
 
-    private async Task<object?> GetIdentifierValueAsync(Identifier identifier)
+    private async Task<object?> EvaluateNestedExpressionAsync(Expression expression, EvaluationTrace? trace)
+    {
+        ShareParametersWithChildExpression(expression);
+
+        if (trace is null)
+            return await expression.EvaluateAsync(CancellationToken);
+
+        return await expression.EvaluateWithTraceAsync(trace, trace.CurrentNodeId, CancellationToken);
+    }
+
+    private async Task<object?> GetIdentifierValueAsync(Identifier identifier, int nodeId, EvaluationTrace? trace)
     {
         var identifierName = identifier.Name;
-
         var parameterArgs = new ParameterEventArgs(identifier.Id, CancellationToken);
 
         context.EvaluateParameterHandler?.Invoke(identifierName, parameterArgs);
+        if (parameterArgs.HasResult)
+        {
+            trace?.ResolveParameter(nodeId, nodeId, identifierName, EvaluationTraceResolutionSource.ParameterHandler, parameterArgs.Result);
+            return parameterArgs.Result;
+        }
 
         if (!parameterArgs.HasResult)
             await (context.EvaluateAsyncParameterHandler?.Invoke(identifierName, parameterArgs) ?? Task.CompletedTask);
 
         if (parameterArgs.HasResult)
+        {
+            trace?.ResolveParameter(nodeId, nodeId, identifierName, EvaluationTraceResolutionSource.AsyncParameterHandler, parameterArgs.Result);
             return parameterArgs.Result;
+        }
 
         if (context.Parameters.TryGetValue(identifierName, out var parameter))
         {
             if (parameter is Expression expression)
             {
                 ShareParametersWithChildExpression(expression);
+                trace?.ResolveParameter(nodeId, nodeId, identifierName, EvaluationTraceResolutionSource.NestedExpression, null);
                 return expression;
             }
 
+            trace?.ResolveParameter(nodeId, nodeId, identifierName, EvaluationTraceResolutionSource.StaticParameter, parameter);
             return parameter;
         }
 
         if (context.DynamicParameters.TryGetValue(identifierName, out var dynamicParameter))
-            return dynamicParameter(new ParameterData(identifier.Id, context, CancellationToken));
+        {
+            var dynamicValue = dynamicParameter(new ParameterData(identifier.Id, context, CancellationToken));
+            trace?.ResolveParameter(nodeId, nodeId, identifierName, EvaluationTraceResolutionSource.DynamicParameter, dynamicValue);
+            return dynamicValue;
+        }
 
         if (context.AsyncParameters.TryGetValue(identifierName, out var asyncParameter))
-            return await asyncParameter(new ParameterData(identifier.Id, context, CancellationToken));
+        {
+            var asyncValue = await asyncParameter(new ParameterData(identifier.Id, context, CancellationToken));
+            trace?.ResolveParameter(nodeId, nodeId, identifierName, EvaluationTraceResolutionSource.AsyncParameter, asyncValue);
+            return asyncValue;
+        }
 
         if (identifierName.Equals("null", StringComparison.InvariantCultureIgnoreCase) &&
             options.AllowNullParameter)
         {
+            trace?.ResolveParameter(nodeId, nodeId, identifierName, EvaluationTraceResolutionSource.NullLiteral, null);
             return null;
         }
 
